@@ -197,54 +197,72 @@ private:
     // In trading, consistency matters more than average speed. malloc can
     // spike when it needs to request memory from the OS (mmap/brk) or
     // when another thread holds the allocator lock. Pool/arena never spike.
+    //
+    // We time batches of allocations to amortize the overhead of
+    // clock_gettime (~20ns) which would otherwise dominate the
+    // measurement for fast allocators like pool and arena.
     // -----------------------------------------------------------------------
 
     static void run_allocation_jitter() {
         printf("  --- Allocation Latency Jitter ---\n\n");
 
-        constexpr size_t OBJECT_SIZE = 64;
-        constexpr int    NUM_ALLOCS  = 100'000;
+        constexpr size_t OBJECT_SIZE  = 64;
+        constexpr int    BATCH_SIZE   = 100;
+        constexpr int    NUM_BATCHES  = 10'000;
+        constexpr int    TOTAL_ALLOCS = BATCH_SIZE * NUM_BATCHES;
 
-        std::vector<double> malloc_times(NUM_ALLOCS);
-        std::vector<double> pool_times(NUM_ALLOCS);
-        std::vector<double> arena_times(NUM_ALLOCS);
+        std::vector<double> malloc_times(NUM_BATCHES);
+        std::vector<double> pool_times(NUM_BATCHES);
+        std::vector<double> arena_times(NUM_BATCHES);
+        std::vector<void*>  ptrs(BATCH_SIZE);
 
-        // Measure individual malloc latencies
-        for (int i = 0; i < NUM_ALLOCS; ++i) {
+        // Measure malloc latencies in batches of 100
+        for (int b = 0; b < NUM_BATCHES; ++b) {
             auto start = now();
-            void* p = std::malloc(OBJECT_SIZE);
+            for (int i = 0; i < BATCH_SIZE; ++i) {
+                ptrs[i] = std::malloc(OBJECT_SIZE);
+                do_not_optimize(ptrs[i]);
+            }
             auto end = now();
-            do_not_optimize(p);
-            malloc_times[i] = elapsed_ns(start, end);
-            std::free(p);
+            malloc_times[b] = elapsed_ns(start, end) / BATCH_SIZE;
+            for (int i = 0; i < BATCH_SIZE; ++i) {
+                std::free(ptrs[i]);
+            }
         }
 
-        // Measure individual pool latencies
-        PoolAllocator pool(OBJECT_SIZE, NUM_ALLOCS);
-        std::vector<void*> pool_ptrs(NUM_ALLOCS);
-        for (int i = 0; i < NUM_ALLOCS; ++i) {
+        // Measure pool latencies in batches of 100
+        PoolAllocator pool(OBJECT_SIZE, TOTAL_ALLOCS);
+        for (int b = 0; b < NUM_BATCHES; ++b) {
             auto start = now();
-            pool_ptrs[i] = pool.allocate();
+            for (int i = 0; i < BATCH_SIZE; ++i) {
+                ptrs[i] = pool.allocate();
+                do_not_optimize(ptrs[i]);
+            }
             auto end = now();
-            do_not_optimize(pool_ptrs[i]);
-            pool_times[i] = elapsed_ns(start, end);
+            pool_times[b] = elapsed_ns(start, end) / BATCH_SIZE;
+            for (int i = 0; i < BATCH_SIZE; ++i) {
+                pool.deallocate(ptrs[i]);
+            }
         }
-        for (int i = 0; i < NUM_ALLOCS; ++i) pool.deallocate(pool_ptrs[i]);
 
-        // Measure individual arena latencies
-        ArenaAllocator arena(OBJECT_SIZE * NUM_ALLOCS);
-        for (int i = 0; i < NUM_ALLOCS; ++i) {
+        // Measure arena latencies in batches of 100
+        ArenaAllocator arena(OBJECT_SIZE * BATCH_SIZE);
+        for (int b = 0; b < NUM_BATCHES; ++b) {
             auto start = now();
-            void* p = arena.allocate(OBJECT_SIZE);
+            for (int i = 0; i < BATCH_SIZE; ++i) {
+                ptrs[i] = arena.allocate(OBJECT_SIZE);
+                do_not_optimize(ptrs[i]);
+            }
             auto end = now();
-            do_not_optimize(p);
-            arena_times[i] = elapsed_ns(start, end);
+            arena_times[b] = elapsed_ns(start, end) / BATCH_SIZE;
+            arena.reset();  // reset for next batch
         }
 
         auto malloc_stats = compute_stats(malloc_times);
         auto pool_stats   = compute_stats(pool_times);
         auto arena_stats  = compute_stats(arena_times);
 
+        printf("  Batch size: %d allocations per timing sample\n\n", BATCH_SIZE);
         printf("  %-12s %8s %8s %8s %8s\n",
                "Allocator", "Median", "P99", "Max", "Jitter");
         print_separator();
@@ -258,11 +276,11 @@ private:
                "Arena", arena_stats.median, arena_stats.p99,
                arena_stats.max, arena_stats.max - arena_stats.median);
 
-        printf("\n  WHY: malloc's max latency can spike 100x+ above median\n");
-        printf("       when it needs to request pages from the OS or contends\n");
-        printf("       with another thread on the allocator lock. Pool and\n");
-        printf("       arena have DETERMINISTIC latency — no OS interaction,\n");
-        printf("       no locks, no surprises. In trading, jitter kills.\n\n");
+        printf("\n  WHY: malloc's p99 and max latency spike when it needs to\n");
+        printf("       request pages from the OS or contends with another thread\n");
+        printf("       on the allocator lock. Pool and arena have deterministic\n");
+        printf("       latency — no OS interaction, no locks, no surprises.\n");
+        printf("       In trading, jitter kills.\n\n");
     }
 };
 

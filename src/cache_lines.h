@@ -4,6 +4,8 @@
 #include <atomic>
 #include <thread>
 #include <new>
+#include <random>
+#include <numeric>
 
 namespace hwbench {
 
@@ -34,6 +36,13 @@ private:
     // a cache line, every write by one core invalidates the other core's
     // cached copy, causing constant cache-line bouncing across the
     // interconnect.
+    //
+    // IMPORTANT: threads must be pinned to different PHYSICAL cores.
+    // Core 0 and core 1 are typically hyperthreads on the same physical
+    // core (shared L1 cache). Core 0 and core 2 are typically different
+    // physical cores with separate L1 caches. Without this pinning,
+    // false sharing may not manifest because both threads share the
+    // same cache.
     // -----------------------------------------------------------------------
 
     struct CountersPacked {
@@ -46,17 +55,35 @@ private:
         alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> b{0};
     };
 
+    // Detect the second physical core. On most x86 systems:
+    //   Core 0, 1 = hyperthreads on physical core 0
+    //   Core 2, 3 = hyperthreads on physical core 1
+    // We want cores 0 and 2 for separate physical cores.
+    static int get_second_core() {
+        int n = static_cast<int>(std::thread::hardware_concurrency());
+        if (n >= 4) {
+            return 2;  // skip hyperthread sibling
+        }
+        if (n >= 2) {
+            return 1;  // only 2 cores available, use what we have
+        }
+        return 0;
+    }
+
     template<typename Counters>
     static double run_counter_test(Counters& counters, int iterations) {
-        auto worker = [](std::atomic<uint64_t>& counter, int n) {
+        int core_b = get_second_core();
+
+        auto worker = [](std::atomic<uint64_t>& counter, int n, int core) {
+            pin_to_core(core);
             for (int i = 0; i < n; ++i) {
                 counter.fetch_add(1, std::memory_order_relaxed);
             }
         };
 
         auto start = now();
-        std::thread t1(worker, std::ref(counters.a), iterations);
-        std::thread t2(worker, std::ref(counters.b), iterations);
+        std::thread t1(worker, std::ref(counters.a), iterations, 0);
+        std::thread t2(worker, std::ref(counters.b), iterations, core_b);
         t1.join();
         t2.join();
         auto end = now();
@@ -68,9 +95,13 @@ private:
         printf("  --- False Sharing ---\n\n");
 
         constexpr int ITERATIONS = 50'000'000;
+        int core_b = get_second_core();
 
         CountersPacked packed;
         CountersPadded padded;
+
+        printf("  Thread A pinned to core 0, Thread B pinned to core %d\n", core_b);
+        printf("  (different physical cores to ensure separate L1 caches)\n\n");
 
         printf("  Packed counters: both on same cache line\n");
         printf("    sizeof(CountersPacked) = %zu bytes\n", sizeof(packed));
@@ -93,27 +124,27 @@ private:
         printf("  %-45s %10.1fx\n", "False sharing penalty",
                packed_ns / padded_ns);
         printf("\n  WHY: Packed counters share a 64-byte cache line.\n");
-        printf("       Every write by core 0 invalidates core 1's cache.\n");
+        printf("       Every write by core 0 invalidates core %d's cache.\n", core_b);
         printf("       Padded counters are on separate lines — no interference.\n\n");
     }
 
     // -----------------------------------------------------------------------
     // TEST 2: Cache Hierarchy
     // -----------------------------------------------------------------------
-    // Sequential read through arrays of increasing size. When the array
-    // fits in L1, access is ~1ns. When it spills to L2, latency jumps.
-    // When it spills to L3, another jump. Beyond L3, main memory: ~100ns.
+    // Pointer-chase through arrays of increasing size using a random
+    // permutation. Each element points to a random other element, forming
+    // a single Hamiltonian cycle. This completely defeats the hardware
+    // prefetcher and measures true memory access latency at each level.
     // -----------------------------------------------------------------------
 
     static void run_cache_hierarchy() {
         printf("  --- Cache Hierarchy Latency ---\n\n");
 
-        // Test sizes: 4KB to 256MB
         size_t sizes[] = {
-            4*KB, 8*KB, 16*KB, 32*KB, 48*KB, 64*KB,       // L1 range
-            128*KB, 256*KB, 512*KB, 1*MB,                    // L2 range
-            2*MB, 4*MB, 8*MB, 16*MB, 32*MB,                 // L3 range
-            64*MB, 128*MB, 256*MB                            // RAM
+            4*KB, 8*KB, 16*KB, 32*KB, 48*KB, 64*KB,
+            128*KB, 256*KB, 512*KB, 1*MB,
+            2*MB, 4*MB, 8*MB, 16*MB, 32*MB,
+            64*MB, 128*MB, 256*MB
         };
 
         constexpr int ACCESSES = 10'000'000;
@@ -122,16 +153,18 @@ private:
         print_separator();
 
         for (size_t size : sizes) {
-            size_t n = size / sizeof(uint64_t);
-            std::vector<uint64_t> data(n, 0);
+            size_t n = size / sizeof(size_t);
 
-            // Create a pointer-chase chain: each element contains the
-            // index of the next element to visit. This defeats the
-            // hardware prefetcher (which only handles sequential access)
-            // and measures true cache latency.
+            // Build a random pointer-chase cycle (Sattolo's algorithm).
+            // Every element points to a different element, forming a single
+            // cycle that visits all elements exactly once. The access pattern
+            // is completely random — the hardware prefetcher cannot predict it.
             std::vector<size_t> chain(n);
-            for (size_t i = 0; i < n; ++i) {
-                chain[i] = (i + 127) % n;  // stride of 127 (prime, not power of 2)
+            std::iota(chain.begin(), chain.end(), 0);
+            std::mt19937_64 rng(42);
+            for (size_t i = n - 1; i > 0; --i) {
+                size_t j = rng() % i;  // Sattolo: j < i, not j <= i
+                std::swap(chain[i], chain[j]);
             }
 
             // Warmup
@@ -153,16 +186,26 @@ private:
             double ns = elapsed_ns(start, end) / ACCESSES;
 
             const char* region;
-            if (size <= 48*KB)       region = "← L1 (~32-48 KB)";
-            else if (size <= 1*MB)   region = "← L2 (~256 KB - 1 MB)";
-            else if (size <= 32*MB)  region = "← L3 (~8-32 MB)";
-            else                     region = "← Main Memory";
+            if (size <= 48*KB) {
+                region = "← L1 (~32-48 KB)";
+            }
+            else if (size <= 1*MB) {
+                region = "← L2 (~256 KB - 1 MB)";
+            }
+            else if (size <= 32*MB) {
+                region = "← L3 (~8-32 MB)";
+            }
+            else {
+                region = "← Main Memory";
+            }
 
             char size_str[32];
-            if (size >= MB)
+            if (size >= MB) {
                 snprintf(size_str, sizeof(size_str), "%zu MB", size / MB);
-            else
+            }
+            else {
                 snprintf(size_str, sizeof(size_str), "%zu KB", size / KB);
+            }
 
             printf("  %-15s %9.1f ns  %s\n", size_str, ns, region);
         }
@@ -171,9 +214,6 @@ private:
 
     // -----------------------------------------------------------------------
     // TEST 3: Sequential vs Random Access
-    // -----------------------------------------------------------------------
-    // The hardware prefetcher detects sequential access patterns and loads
-    // the next cache line before you need it. Random access defeats this.
     // -----------------------------------------------------------------------
 
     static void run_sequential_vs_random() {
@@ -195,7 +235,7 @@ private:
         auto end = now();
         double sequential_ns = elapsed_ns(start, end) / ACCESSES;
 
-        // Random access (same data, different pattern)
+        // Random access
         std::mt19937_64 rng(42);
         std::vector<size_t> random_indices(ACCESSES);
         for (auto& idx : random_indices) {
@@ -218,7 +258,7 @@ private:
         printf("\n  WHY: Sequential access lets the hardware prefetcher load\n");
         printf("       the next cache line before you need it — effectively free.\n");
         printf("       Random access defeats prefetching — every access may\n");
-        printf("       miss cache and go to main memory (~100ns).\n\n");
+        printf("       miss cache and go to main memory.\n\n");
     }
 };
 

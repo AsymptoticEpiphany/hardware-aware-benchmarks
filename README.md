@@ -2,7 +2,7 @@
 
 Empirical measurements of hardware-level performance effects that matter for low-latency systems: TLB behavior, cache hierarchy, NUMA topology, branch prediction, memory layout, prefetching, and allocator overhead.
 
-Each benchmark runs millions of iterations, measures the effect in nanoseconds, and explains *why* the hardware behaves this way — connecting the measurement to practical systems design decisions.
+Each benchmark runs millions of iterations, measures the effect in nanoseconds, and explains *why* the hardware behaves this way, thus connecting the measurement to practical systems design decisions.
 
 ## Building
 
@@ -14,7 +14,7 @@ cmake ..
 make
 ```
 
-Builds with `-O2 -march=native` by default — benchmarking unoptimized code is meaningless.
+Builds with `-O2 -march=native` by default (benchmarking unoptimized code is meaningless).
 
 ## Running
 
@@ -39,14 +39,14 @@ For best results:
 taskset -c 0 ./hw_bench all
 
 # For TLB benchmark (requires root)
-echo 256 > /proc/sys/vm/nr_hugepages
+echo 256 | sudo tee /proc/sys/vm/nr_hugepages
 ```
 
 ## What's Measured
 
 ### 1. TLB & Huge Pages (`tlb`)
 
-Compares random access latency across a 256 MB buffer using 4 KB pages vs 2 MB huge pages. With 4 KB pages, the buffer spans 65,536 pages — far more than the ~1,500-entry TLB can hold. Random access causes constant TLB misses, each costing 10-30 ns for a page table walk. With 2 MB huge pages, the same buffer spans only 128 pages — fits entirely in the TLB, eliminating misses.
+Compares random access latency across a 256 MB buffer using 4 KB pages vs 2 MB huge pages. With 4 KB pages, the buffer spans 65,536 pages — far more than the ~1,500-entry TLB can hold. Random access causes constant TLB misses, each costing 10-30 ns for a page table walk. With 2 MB huge pages, the same buffer spans only 128 pages, which fits entirely in the TLB eliminating misses.
 
 **Why it matters:** DPDK uses huge pages for packet buffers. Any large pre-allocated data structure (hash maps, order book arrays) benefits from huge pages when access patterns are random.
 
@@ -58,9 +58,9 @@ Three tests:
 
 **Cache hierarchy:** Pointer-chase traversal through arrays of increasing size reveals the L1/L2/L3/RAM latency boundaries. Typical results: ~1 ns (L1), ~4 ns (L2), ~10 ns (L3), ~100 ns (RAM).
 
-**Sequential vs random access:** Same 64 MB buffer, different access patterns. Sequential access lets the hardware prefetcher pre-load cache lines — effectively free. Random access defeats prefetching, hitting main memory on most accesses. Typical penalty: 10-100x.
+**Sequential vs random access:** Same 64 MB buffer, different access patterns. Sequential access lets the hardware prefetcher pre-load cache lines, which makes them effectively free. Random access defeats prefetching, hitting main memory on most accesses. Typical penalty: 10-100x.
 
-**Why it matters:** False sharing between producer and consumer atomics (e.g., head/tail in a lock-free queue) is a classic performance bug. Understanding cache hierarchy sizes tells you how much data can stay "hot." Sequential access patterns should be preferred wherever possible.
+**Why it matters:** False sharing between producer and consumer atomics (e.g., head/tail in a lock-free queue) is a classic performance bug. Understanding cache hierarchy sizes tells you how much data can stay "hot." Sequential access patterns should be preferred wherever possible. For an example of a lock-free multi-producer multi-consumer queue see here: https://github.com/AsymptoticEpiphany/finra-trace-pipeline
 
 ### 3. NUMA Topology (`numa`)
 
@@ -72,9 +72,9 @@ On multi-socket servers, memory attached to your CPU socket is "local" (~100 ns 
 
 ### 4. Branch Prediction (`branch`)
 
-**Sorted vs unsorted:** The classic benchmark — conditional sum over sorted vs unsorted data. The branch predictor learns the sorted pattern (all false, then all true) but can't predict random data near the threshold, causing pipeline flushes on every misprediction (~15-20 cycles).
+**Sorted vs unsorted:** Conditional sum over sorted vs unsorted data. The branch predictor learns the sorted pattern (all false, then all true) but can't predict random data near the threshold, causing pipeline flushes on every misprediction (~15-20 cycles).
 
-**Branchy vs branchless:** Replaces the if/else with arithmetic bit masking that produces the same result without a branch instruction. No prediction needed, no pipeline flushes. Typical speedup: 2-5x on unpredictable data.
+**Branchy vs branchless:** Replaces the if/else with arithmetic bit masking that produces the same result without a branch instruction. No prediction needed and no pipeline flushes. Typical speedup: 2-5x on unpredictable data.
 
 **Why it matters:** Hot-path code with unpredictable conditions (market data validation, price threshold checks) should use branchless techniques or `__builtin_expect` hints to minimize misprediction penalties.
 

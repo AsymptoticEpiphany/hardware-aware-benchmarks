@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
     printf("Hardware-Aware Systems Benchmark Suite\n");
     printf("Build: -O2 -march=native\n");
     printf("Each benchmark runs millions of iterations for statistical\n");
-    printf("significance. Total runtime: ~60-120 seconds for all.\n");
+    printf("significance. Total runtime: ~10-30 seconds for all.\n");
 
     bool run_all = (strcmp(which, "all") == 0);
 

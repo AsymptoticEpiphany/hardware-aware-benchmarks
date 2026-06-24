@@ -19,7 +19,7 @@ Builds with `-O2 -march=native` by default — benchmarking unoptimized code is 
 ## Running
 
 ```bash
-# Run all benchmarks (~60-120 seconds)
+# Run all benchmarks (~10-30 seconds depending on CPU)
 ./hw_bench all
 
 # Run a specific benchmark
